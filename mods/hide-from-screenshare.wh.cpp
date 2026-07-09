@@ -1,7 +1,7 @@
 // ==WindhawkMod==
-// @id              hide-from-screenshare
-// @name            Capture Toggle
-// @description     Toggle screen-capture exclusion for Windows 11 taskbar apps, with protected-app blocking and an optional hidden-window border.
+// @id              hide-from-screencapture
+// @name            Hide From Screencapture
+// @description     Toggle screen-capture exclusion for Windows 11 taskbar apps, with a optional hidden-window border.
 // @version         1.0.0
 // @author          AjaxFNC
 // @architecture    x86-64
