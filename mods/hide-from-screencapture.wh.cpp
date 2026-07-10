@@ -1,9 +1,10 @@
 // ==WindhawkMod==
-// @id              hide-from-screencapture
-// @name            Hide From Screencapture
-// @description     Toggle screen-capture exclusion for Windows 11 taskbar apps, with a optional hidden-window border.
+// @id              hide-from-screenshare
+// @name            Capture Toggle
+// @description     Toggle screen-capture exclusion for Windows 11 taskbar apps, with protected-app blocking and an optional hidden-window border.
 // @version         1.0.0
-// @author          AjaxFNC
+
+// @github          AjaxFNC-YT
 // @architecture    x86-64
 // @include         *
 // @compilerOptions -lole32 -loleaut32 -luuid -lshell32 -lpropsys -lruntimeobject -luiautomationcore -lcomctl32 -ldwmapi -lshlwapi
@@ -114,7 +115,7 @@ constexpr wchar_t kOriginalWndProcPropName[] =
 constexpr UINT kSwallowWindowMs = 500;
 constexpr UINT kToggleSendTimeoutMs = 700;
 constexpr COLORREF kHiddenBorderColor = RGB(136, 136, 136);
-constexpr COLORREF kDwmDefaultColor = 0xFFFFFFFF;
+constexpr COLORREF kDwmDefaultColor = 0xFFFFFFFF; 
 
 constexpr DWORD kWdaExcludeFromCapture = 0x00000011;
 constexpr DWORD kWdaMonitor = 0x00000001;
