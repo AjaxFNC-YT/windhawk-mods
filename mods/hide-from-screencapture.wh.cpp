@@ -3,7 +3,7 @@
 // @name            Capture Toggle
 // @description     Toggle screen-capture exclusion for Windows 11 taskbar apps, with protected-app blocking and an optional hidden-window border.
 // @version         1.0.0
-
+// @author          AjaxFNC
 // @github          AjaxFNC-YT
 // @architecture    x86-64
 // @include         *
@@ -114,6 +114,8 @@ constexpr wchar_t kOriginalWndProcPropName[] =
     L"Windhawk.HideFromScreenCapture.OriginalWndProc";
 constexpr UINT kSwallowWindowMs = 500;
 constexpr UINT kToggleSendTimeoutMs = 700;
+constexpr UINT_PTR kExplorerHookRetryTimerId = 1;
+constexpr UINT kExplorerHookRetryIntervalMs = 2000;
 constexpr COLORREF kHiddenBorderColor = RGB(136, 136, 136);
 constexpr COLORREF kDwmDefaultColor = 0xFFFFFFFF; 
 
@@ -1763,6 +1765,41 @@ LRESULT CALLBACK ExplorerKeyboardHookProc(int code,
     return CallNextHookEx(g_explorerKeyboardHook, code, wParam, lParam);
 }
 
+void EnsureExplorerHooksInstalled(HMODULE thisModule) {
+    if (!g_explorerMouseHook) {
+        g_explorerMouseHook = SetWindowsHookExW(WH_MOUSE_LL,
+                                                ExplorerMouseHookProc,
+                                                thisModule, 0);
+        if (!g_explorerMouseHook) {
+            Log(L"EnsureExplorerHooksInstalled: SetWindowsHookExW mouse failed gle=%lu",
+                GetLastError());
+        } else {
+            Log(L"EnsureExplorerHooksInstalled: low-level mouse hook installed");
+        }
+    }
+
+    if (!TriggerModeHasHotkey()) {
+        if (g_explorerKeyboardHook) {
+            UnhookWindowsHookEx(g_explorerKeyboardHook);
+            g_explorerKeyboardHook = nullptr;
+            Log(L"EnsureExplorerHooksInstalled: low-level keyboard hook removed");
+        }
+        return;
+    }
+
+    if (!g_explorerKeyboardHook) {
+        g_explorerKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL,
+                                                   ExplorerKeyboardHookProc,
+                                                   thisModule, 0);
+        if (!g_explorerKeyboardHook) {
+            Log(L"EnsureExplorerHooksInstalled: SetWindowsHookExW keyboard failed gle=%lu",
+                GetLastError());
+        } else {
+            Log(L"EnsureExplorerHooksInstalled: low-level keyboard hook installed");
+        }
+    }
+}
+
 DWORD WINAPI ExplorerHookThreadMain(LPVOID) {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     const bool uninitCo = SUCCEEDED(hr);
@@ -1774,35 +1811,22 @@ DWORD WINAPI ExplorerHookThreadMain(LPVOID) {
     EnsureToggleMessageRegistered();
 
     HMODULE thisModule = reinterpret_cast<HMODULE>(&__ImageBase);
-    g_explorerMouseHook = SetWindowsHookExW(WH_MOUSE_LL, ExplorerMouseHookProc,
-                                            thisModule, 0);
-    if (!g_explorerMouseHook) {
-        Log(L"ExplorerHookThreadMain: SetWindowsHookExW failed gle=%lu",
-            GetLastError());
-        if (uninitCo) {
-            CoUninitialize();
-        }
-        return 0;
-    }
-
-    if (TriggerModeHasHotkey()) {
-        g_explorerKeyboardHook = SetWindowsHookExW(
-            WH_KEYBOARD_LL, ExplorerKeyboardHookProc, thisModule, 0);
-        if (!g_explorerKeyboardHook) {
-            Log(L"ExplorerHookThreadMain: SetWindowsHookExW keyboard failed gle=%lu",
-                GetLastError());
-        } else {
-            Log(L"ExplorerHookThreadMain: low-level keyboard hook installed");
-        }
-    }
-
-    Log(L"ExplorerHookThreadMain: low-level mouse hook installed");
+    SetTimer(nullptr, kExplorerHookRetryTimerId, kExplorerHookRetryIntervalMs,
+             nullptr);
+    EnsureExplorerHooksInstalled(thisModule);
 
     MSG msg;
     while (!g_unloading.load() && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_TIMER &&
+            msg.wParam == kExplorerHookRetryTimerId) {
+            EnsureExplorerHooksInstalled(thisModule);
+            continue;
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+
+    KillTimer(nullptr, kExplorerHookRetryTimerId);
 
     if (g_explorerMouseHook) {
         UnhookWindowsHookEx(g_explorerMouseHook);
