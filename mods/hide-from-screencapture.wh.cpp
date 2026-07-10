@@ -1,13 +1,12 @@
 // ==WindhawkMod==
-// @id              hide-from-screencapture
+// @id              hide-from-screenshare
 // @name            Capture Toggle
 // @description     Toggle screen-capture exclusion for Windows 11 taskbar apps, with protected-app blocking and an optional hidden-window border.
 // @version         1.0.0
 // @author          AjaxFNC
-// @github          https://github.com/AjaxFNC-YT
-// @architecture    x86-64
+// @github          AjaxFNC-YT
 // @include         *
-// @compilerOptions -lole32 -loleaut32 -luuid -lshell32 -lpropsys -lruntimeobject -luiautomationcore -lcomctl32 -ldwmapi -lshlwapi
+// @compilerOptions -lole32 -loleaut32 -luuid -lshell32 -lpropsys -lruntimeobject -luiautomationcore -ldwmapi -lshlwapi
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -20,12 +19,13 @@ touching known anti-cheat and game installs.
 Using capture-hiding tricks on games can cause instability, crashes, or even
 anti-cheat trouble such as an in-game ban.
 
-To reduce that risk, this mod refuses to operate on a built-in protected list
-covering common anti-cheat environments such as Riot Vanguard, Easy Anti-Cheat,
-Easy Anti-Cheat EOS, and BattlEye, along with known protected executables.
+To reduce that risk, this mod uses a best-effort protected list covering common
+anti-cheat environments such as Riot Vanguard, Easy Anti-Cheat, Easy Anti-Cheat
+EOS, and BattlEye, along with known protected executables. The list can't detect
+every anti-cheat installation or configuration and isn't a safety guarantee.
 
-You can disable that protection list in the mod settings, but doing so may
-cause game crashes, anti-cheat problems, or in-game bans.
+You can disable the protection list in the mod settings, but targeting games can
+still cause crashes, anti-cheat problems, or in-game bans.
 
 ## Trigger options
 You can keep the original middle-click behavior, switch to a hover hotkey, or
@@ -47,14 +47,14 @@ most likely broken.
   $name: Disable protected-app blocking
   $description: Allows the mod to target apps that are normally blocked. This may cause crashes, anti-cheat issues, or in-game bans.
 
-- TriggerModeV2: MiddleClick
+- TriggerMode: MiddleClick
   $name: Trigger mode
   $options:
   - MiddleClick: Middle click
   - HoverHotkey: Hover hotkey
   - Both: Middle click and hover hotkey
 
-- TriggerModifierV2: None
+- TriggerModifier: None
   $name: Modifier for middle click
   $description: Optional modifier required for the middle-click trigger.
   $options:
@@ -64,7 +64,7 @@ most likely broken.
   - Alt: Alt
   - Win: Win
 
-- HoverHotkeyV2: F8
+- HoverHotkey: F8
   $name: Hover hotkey
   $description: Press this key while hovering a taskbar app button when hover hotkey mode is enabled.
   $options:
@@ -88,7 +88,6 @@ most likely broken.
 #include <propvarutil.h>
 #include <shlwapi.h>
 #include <uiautomation.h>
-#include <commctrl.h>
 #include <wrl.h>
 
 #include <algorithm>
@@ -108,14 +107,14 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 
 constexpr wchar_t kToggleMessageName[] =
     L"Windhawk.HideFromScreenCapture.ToggleMessage.v1";
-constexpr wchar_t kSubclassPropName[] =
-    L"Windhawk.HideFromScreenCapture.Subclassed";
-constexpr wchar_t kOriginalWndProcPropName[] =
-    L"Windhawk.HideFromScreenCapture.OriginalWndProc";
+constexpr wchar_t kReceiverWindowClassName[] =
+    L"Windhawk.HideFromScreenCapture.Receiver.v1";
 constexpr UINT kSwallowWindowMs = 500;
 constexpr UINT kToggleSendTimeoutMs = 700;
-constexpr UINT_PTR kExplorerHookRetryTimerId = 1;
+constexpr UINT kExplorerHookRetryTimerId = 1;
 constexpr UINT kExplorerHookRetryIntervalMs = 2000;
+constexpr UINT kExplorerToggleMessage = WM_APP + 1;
+constexpr UINT kStopReceiverMessage = WM_APP + 2;
 constexpr COLORREF kHiddenBorderColor = RGB(136, 136, 136);
 constexpr COLORREF kDwmDefaultColor = 0xFFFFFFFF; 
 
@@ -184,9 +183,6 @@ struct ModSettings {
     HoverHotkey hoverHotkey = HoverHotkey::F8;
 };
 
-using CreateWindowExW_t = decltype(&CreateWindowExW);
-CreateWindowExW_t g_originalCreateWindowExW = nullptr;
-
 UINT g_toggleMessage = 0;
 
 std::atomic<bool> g_processIsExplorer{false};
@@ -198,6 +194,11 @@ std::unordered_map<HWND, DWORD> g_managedWindowOriginalAffinity;
 std::unordered_set<HWND> g_windowsWithHiddenBorder;
 ModSettings g_settings;
 
+HANDLE g_receiverThread = nullptr;
+DWORD g_receiverThreadId = 0;
+HANDLE g_receiverReadyEvent = nullptr;
+std::atomic<HWND> g_receiverWindow{nullptr};
+
 HANDLE g_explorerHookThread = nullptr;
 DWORD g_explorerHookThreadId = 0;
 HHOOK g_explorerMouseHook = nullptr;
@@ -206,8 +207,7 @@ ComPtr<IUIAutomation> g_uia;
 
 std::atomic<DWORD> g_swallowStartTick{0};
 std::atomic<bool> g_hotkeyDown{false};
-
-void Log(const wchar_t* fmt, ...);
+std::atomic<bool> g_hotkeySwallowed{false};
 
 template <size_t N>
 bool SettingEquals(PCWSTR value, const wchar_t (&literal)[N]) {
@@ -219,56 +219,18 @@ void LoadSettings() {
     g_settings.disableProtectionList =
         Wh_GetIntSetting(L"DisableProtectionList") != 0;
 
-    PCWSTR triggerModeSetting = Wh_GetStringSetting(L"TriggerModeV2");
-    if (!triggerModeSetting || !*triggerModeSetting) {
-        Wh_FreeStringSetting(triggerModeSetting);
-        const int legacyTriggerMode = Wh_GetIntSetting(L"TriggerMode");
-        switch (legacyTriggerMode) {
-            case 1:
-                g_settings.triggerMode = TriggerMode::HoverHotkey;
-                break;
-            case 2:
-                g_settings.triggerMode = TriggerMode::Both;
-                break;
-            case 0:
-            default:
-                g_settings.triggerMode = TriggerMode::MiddleClick;
-                break;
-        }
-    } else if (SettingEquals(triggerModeSetting, L"HoverHotkey")) {
+    PCWSTR triggerModeSetting = Wh_GetStringSetting(L"TriggerMode");
+    if (SettingEquals(triggerModeSetting, L"HoverHotkey")) {
         g_settings.triggerMode = TriggerMode::HoverHotkey;
-        Wh_FreeStringSetting(triggerModeSetting);
     } else if (SettingEquals(triggerModeSetting, L"Both")) {
         g_settings.triggerMode = TriggerMode::Both;
-        Wh_FreeStringSetting(triggerModeSetting);
     } else {
         g_settings.triggerMode = TriggerMode::MiddleClick;
-        Wh_FreeStringSetting(triggerModeSetting);
     }
+    Wh_FreeStringSetting(triggerModeSetting);
 
-    PCWSTR triggerModifierSetting = Wh_GetStringSetting(L"TriggerModifierV2");
-    if (!triggerModifierSetting || !*triggerModifierSetting) {
-        Wh_FreeStringSetting(triggerModifierSetting);
-        const int legacyTriggerModifier = Wh_GetIntSetting(L"TriggerModifier");
-        switch (legacyTriggerModifier) {
-            case 1:
-                g_settings.triggerModifier = TriggerModifier::Ctrl;
-                break;
-            case 2:
-                g_settings.triggerModifier = TriggerModifier::Shift;
-                break;
-            case 3:
-                g_settings.triggerModifier = TriggerModifier::Alt;
-                break;
-            case 4:
-                g_settings.triggerModifier = TriggerModifier::Win;
-                break;
-            case 0:
-            default:
-                g_settings.triggerModifier = TriggerModifier::None;
-                break;
-        }
-    } else if (SettingEquals(triggerModifierSetting, L"Ctrl")) {
+    PCWSTR triggerModifierSetting = Wh_GetStringSetting(L"TriggerModifier");
+    if (SettingEquals(triggerModifierSetting, L"Ctrl")) {
         g_settings.triggerModifier = TriggerModifier::Ctrl;
     } else if (SettingEquals(triggerModifierSetting, L"Shift")) {
         g_settings.triggerModifier = TriggerModifier::Shift;
@@ -279,39 +241,10 @@ void LoadSettings() {
     } else {
         g_settings.triggerModifier = TriggerModifier::None;
     }
-    if (triggerModifierSetting && *triggerModifierSetting) {
-        Wh_FreeStringSetting(triggerModifierSetting);
-    }
+    Wh_FreeStringSetting(triggerModifierSetting);
 
-    PCWSTR hoverHotkeySetting = Wh_GetStringSetting(L"HoverHotkeyV2");
-    if (!hoverHotkeySetting || !*hoverHotkeySetting) {
-        Wh_FreeStringSetting(hoverHotkeySetting);
-        const int legacyHoverHotkey = Wh_GetIntSetting(L"HoverHotkey");
-        switch (legacyHoverHotkey) {
-            case 1:
-                g_settings.hoverHotkey = HoverHotkey::F9;
-                break;
-            case 2:
-                g_settings.hoverHotkey = HoverHotkey::F10;
-                break;
-            case 3:
-                g_settings.hoverHotkey = HoverHotkey::F11;
-                break;
-            case 4:
-                g_settings.hoverHotkey = HoverHotkey::F12;
-                break;
-            case 5:
-                g_settings.hoverHotkey = HoverHotkey::Pause;
-                break;
-            case 6:
-                g_settings.hoverHotkey = HoverHotkey::ScrollLock;
-                break;
-            case 0:
-            default:
-                g_settings.hoverHotkey = HoverHotkey::F8;
-                break;
-        }
-    } else if (SettingEquals(hoverHotkeySetting, L"F9")) {
+    PCWSTR hoverHotkeySetting = Wh_GetStringSetting(L"HoverHotkey");
+    if (SettingEquals(hoverHotkeySetting, L"F9")) {
         g_settings.hoverHotkey = HoverHotkey::F9;
     } else if (SettingEquals(hoverHotkeySetting, L"F10")) {
         g_settings.hoverHotkey = HoverHotkey::F10;
@@ -326,11 +259,9 @@ void LoadSettings() {
     } else {
         g_settings.hoverHotkey = HoverHotkey::F8;
     }
-    if (hoverHotkeySetting && *hoverHotkeySetting) {
-        Wh_FreeStringSetting(hoverHotkeySetting);
-    }
+    Wh_FreeStringSetting(hoverHotkeySetting);
 
-    Log(L"LoadSettings: showHiddenBorder=%d disableProtectionList=%d triggerMode=%d triggerModifier=%d hoverHotkey=%d",
+    Wh_Log(L"LoadSettings: showHiddenBorder=%d disableProtectionList=%d triggerMode=%d triggerModifier=%d hoverHotkey=%d",
         g_settings.showHiddenBorder ? 1 : 0,
         g_settings.disableProtectionList ? 1 : 0,
         static_cast<int>(g_settings.triggerMode),
@@ -392,24 +323,15 @@ UINT EnsureToggleMessageRegistered() {
 
     const UINT msg = RegisterWindowMessageW(kToggleMessageName);
     if (msg == 0) {
-        Log(L"EnsureToggleMessageRegistered: RegisterWindowMessageW failed gle=%lu",
+        Wh_Log(L"EnsureToggleMessageRegistered: RegisterWindowMessageW failed gle=%lu",
             GetLastError());
         return 0;
     }
 
     g_toggleMessage = msg;
-    Log(L"EnsureToggleMessageRegistered: registered msg=0x%X pid=%lu", msg,
+    Wh_Log(L"EnsureToggleMessageRegistered: registered msg=0x%X pid=%lu", msg,
         GetCurrentProcessId());
     return msg;
-}
-
-void Log(const wchar_t* fmt, ...) {
-    wchar_t buffer[2048];
-    va_list args;
-    va_start(args, fmt);
-    _vsnwprintf_s(buffer, _countof(buffer), _TRUNCATE, fmt, args);
-    va_end(args);
-    Wh_Log(L"%s", buffer);
 }
 
 std::wstring ToLower(std::wstring value) {
@@ -453,34 +375,6 @@ bool ContainsNormalized(const std::wstring& haystack,
     const std::wstring normNeedle = NormalizeForMatch(needle);
     return !normNeedle.empty() &&
            normHaystack.find(normNeedle) != std::wstring::npos;
-}
-
-std::wstring EscapeXml(const std::wstring& text) {
-    std::wstring escaped;
-    escaped.reserve(text.size() + 16);
-    for (wchar_t ch : text) {
-        switch (ch) {
-            case L'&':
-                escaped += L"&amp;";
-                break;
-            case L'<':
-                escaped += L"&lt;";
-                break;
-            case L'>':
-                escaped += L"&gt;";
-                break;
-            case L'"':
-                escaped += L"&quot;";
-                break;
-            case L'\'':
-                escaped += L"&apos;";
-                break;
-            default:
-                escaped.push_back(ch);
-                break;
-        }
-    }
-    return escaped;
 }
 
 std::wstring GetWindowTextString(HWND hwnd) {
@@ -683,33 +577,6 @@ bool IsCandidateTopLevelWindow(HWND hwnd) {
     return true;
 }
 
-bool IsSubclassableTopLevelWindow(HWND hwnd) {
-    if (!IsWindow(hwnd)) {
-        return false;
-    }
-    if (GetAncestor(hwnd, GA_ROOT) != hwnd) {
-        return false;
-    }
-
-    const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-    if (style & WS_CHILD) {
-        return false;
-    }
-
-    const LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    if (exStyle & WS_EX_TOOLWINDOW) {
-        return false;
-    }
-
-    wchar_t className[128];
-    if (GetClassNameW(hwnd, className, ARRAYSIZE(className)) &&
-        IsTaskbarWindowClass(className)) {
-        return false;
-    }
-
-    return true;
-}
-
 bool IsDefinitelyNonPrimaryWindowClass(const wchar_t* className) {
     if (!className || !*className) {
         return false;
@@ -886,12 +753,6 @@ struct FindWindowContext {
     WindowCandidate best;
 };
 
-struct ProcessMessageTargetContext {
-    DWORD pid = 0;
-    HWND preferred = nullptr;
-    HWND fallback = nullptr;
-};
-
 BOOL CALLBACK EnumWindowsForTaskbarMatch(HWND hwnd, LPARAM lParam) {
     auto* context = reinterpret_cast<FindWindowContext*>(lParam);
     if (!context || !IsCandidateTopLevelWindow(hwnd)) {
@@ -921,26 +782,6 @@ BOOL CALLBACK EnumWindowsForTaskbarMatch(HWND hwnd, LPARAM lParam) {
     return TRUE;
 }
 
-BOOL CALLBACK EnumWindowsForProcessMessageTarget(HWND hwnd, LPARAM lParam) {
-    auto* context = reinterpret_cast<ProcessMessageTargetContext*>(lParam);
-    if (!context || !IsCandidateTopLevelWindow(hwnd)) {
-        return TRUE;
-    }
-
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    if (pid != context->pid) {
-        return TRUE;
-    }
-
-    if (hwnd == context->preferred) {
-        return TRUE;
-    }
-
-    context->fallback = hwnd;
-    return FALSE;
-}
-
 bool ResolveTaskbarButtonTargetWindow(POINT pt,
                                       HWND* targetWindow,
                                       std::wstring* displayName) {
@@ -955,7 +796,7 @@ bool ResolveTaskbarButtonTargetWindow(POINT pt,
 
     HWND taskbarRoot = nullptr;
     if (!IsPointOnTaskbar(pt, &taskbarRoot)) {
-        Log(L"ResolveTaskbarButtonTargetWindow: point (%ld,%ld) is not on taskbar",
+        Wh_Log(L"ResolveTaskbarButtonTargetWindow: point (%ld,%ld) is not on taskbar",
             pt.x, pt.y);
         return false;
     }
@@ -968,7 +809,7 @@ bool ResolveTaskbarButtonTargetWindow(POINT pt,
             if (FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr,
                                         CLSCTX_INPROC_SERVER,
                                         IID_PPV_ARGS(&g_uia)))) {
-                Log(L"ResolveTaskbarButtonTargetWindow: failed to create UI Automation");
+                Wh_Log(L"ResolveTaskbarButtonTargetWindow: failed to create UI Automation");
                 return false;
             }
         }
@@ -976,14 +817,14 @@ bool ResolveTaskbarButtonTargetWindow(POINT pt,
 
     ComPtr<IUIAutomationElement> elementAtPoint;
     if (FAILED(g_uia->ElementFromPoint(pt, &elementAtPoint)) || !elementAtPoint) {
-        Log(L"ResolveTaskbarButtonTargetWindow: UIA ElementFromPoint failed at (%ld,%ld)",
+        Wh_Log(L"ResolveTaskbarButtonTargetWindow: UIA ElementFromPoint failed at (%ld,%ld)",
             pt.x, pt.y);
         return false;
     }
 
     ComPtr<IUIAutomationTreeWalker> controlWalker;
     if (FAILED(g_uia->get_ControlViewWalker(&controlWalker)) || !controlWalker) {
-        Log(L"ResolveTaskbarButtonTargetWindow: failed to get control-view walker");
+        Wh_Log(L"ResolveTaskbarButtonTargetWindow: failed to get control-view walker");
         return false;
     }
 
@@ -1002,7 +843,7 @@ bool ResolveTaskbarButtonTargetWindow(POINT pt,
                     *displayName = GetModuleBaseNameForPid(pid);
                 }
             }
-            Log(L"ResolveTaskbarButtonTargetWindow: direct UIA native hwnd match -> hwnd=0x%p label=%s",
+            Wh_Log(L"ResolveTaskbarButtonTargetWindow: direct UIA native hwnd match -> hwnd=0x%p label=%s",
                 directWindow, displayName ? displayName->c_str() : L"");
             return true;
         }
@@ -1030,7 +871,7 @@ bool ResolveTaskbarButtonTargetWindow(POINT pt,
             LooksLikeTaskbarButtonElement(descriptor,
                                           GetElementControlType(current.Get()))) {
             bestDescriptor = descriptor;
-            Log(L"ResolveTaskbarButtonTargetWindow: selected taskbar descriptor name='%s' automationId='%s' class='%s' framework='%s' help='%s' status='%s'",
+            Wh_Log(L"ResolveTaskbarButtonTargetWindow: selected taskbar descriptor name='%s' automationId='%s' class='%s' framework='%s' help='%s' status='%s'",
                 bestDescriptor.name.c_str(),
                 bestDescriptor.automationId.c_str(),
                 bestDescriptor.className.c_str(),
@@ -1048,7 +889,7 @@ bool ResolveTaskbarButtonTargetWindow(POINT pt,
     }
 
     if (bestDescriptor.name.empty() && bestDescriptor.helpText.empty()) {
-        Log(L"ResolveTaskbarButtonTargetWindow: no usable taskbar descriptor found");
+        Wh_Log(L"ResolveTaskbarButtonTargetWindow: no usable taskbar descriptor found");
         return false;
     }
 
@@ -1064,7 +905,7 @@ bool ResolveTaskbarButtonTargetWindow(POINT pt,
     EnumWindows(EnumWindowsForTaskbarMatch, reinterpret_cast<LPARAM>(&context));
 
     if (!context.best.hwnd || context.best.score < 35) {
-        Log(L"ResolveTaskbarButtonTargetWindow: no window match found for descriptor name='%s' help='%s' bestScore=%d",
+        Wh_Log(L"ResolveTaskbarButtonTargetWindow: no window match found for descriptor name='%s' help='%s' bestScore=%d",
             bestDescriptor.name.c_str(), bestDescriptor.helpText.c_str(),
             context.best.score);
         return false;
@@ -1078,7 +919,7 @@ bool ResolveTaskbarButtonTargetWindow(POINT pt,
                                   ? context.best.exeBaseName
                                   : bestDescriptor.name);
     }
-    Log(L"ResolveTaskbarButtonTargetWindow: scored match -> hwnd=0x%p pid=%lu score=%d title='%s' exe='%s' appid='%s'",
+    Wh_Log(L"ResolveTaskbarButtonTargetWindow: scored match -> hwnd=0x%p pid=%lu score=%d title='%s' exe='%s' appid='%s'",
         context.best.hwnd, context.best.pid, context.best.score,
         context.best.title.c_str(), context.best.exeBaseName.c_str(),
         context.best.appUserModelId.c_str());
@@ -1113,15 +954,11 @@ bool HasManagedWindows() {
     return !g_managedWindowOriginalAffinity.empty();
 }
 
-bool IsProcessHiddenByMod() {
-    return HasManagedWindows() || g_processHidden.load();
-}
-
 void RememberManagedWindowAffinity(HWND hwnd, DWORD originalAffinity) {
     std::scoped_lock lock(g_windowAffinityMutex);
     const auto [it, inserted] =
         g_managedWindowOriginalAffinity.emplace(hwnd, originalAffinity);
-    Log(L"RememberManagedWindowAffinity: hwnd=0x%p originalAffinity=0x%08X inserted=%d stored=0x%08X",
+    Wh_Log(L"RememberManagedWindowAffinity: hwnd=0x%p originalAffinity=0x%08X inserted=%d stored=0x%08X",
         hwnd, originalAffinity, inserted ? 1 : 0, it->second);
 }
 
@@ -1143,7 +980,7 @@ bool GetManagedWindowOriginalAffinity(HWND hwnd, DWORD* originalAffinity) {
 void ForgetManagedWindowAffinity(HWND hwnd) {
     std::scoped_lock lock(g_windowAffinityMutex);
     const size_t erased = g_managedWindowOriginalAffinity.erase(hwnd);
-    Log(L"ForgetManagedWindowAffinity: hwnd=0x%p erased=%zu remaining=%zu", hwnd,
+    Wh_Log(L"ForgetManagedWindowAffinity: hwnd=0x%p erased=%zu remaining=%zu", hwnd,
         erased, g_managedWindowOriginalAffinity.size());
 }
 
@@ -1175,36 +1012,12 @@ void ApplyHiddenBorderIndicator(HWND hwnd, bool hidden) {
     if (SUCCEEDED(DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &color,
                                         sizeof(color)))) {
         SetManagedWindowBorderState(hwnd, hidden);
-        Log(L"ApplyHiddenBorderIndicator: hwnd=0x%p hidden=%d color=0x%08X",
+        Wh_Log(L"ApplyHiddenBorderIndicator: hwnd=0x%p hidden=%d color=0x%08X",
             hwnd, hidden ? 1 : 0, color);
     } else {
-        Log(L"ApplyHiddenBorderIndicator: DwmSetWindowAttribute failed hwnd=0x%p hidden=%d",
+        Wh_Log(L"ApplyHiddenBorderIndicator: DwmSetWindowAttribute failed hwnd=0x%p hidden=%d",
             hwnd, hidden ? 1 : 0);
     }
-}
-
-BOOL CALLBACK EnumCurrentProcessWindowsForBorderRefresh(HWND hwnd, LPARAM lParam) {
-    const bool hideBorder = lParam != 0;
-
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    if (pid != GetCurrentProcessId()) {
-        return TRUE;
-    }
-
-    if (!IsLikelyUserFacingPrimaryWindow(hwnd)) {
-        return TRUE;
-    }
-
-    if (hideBorder) {
-        if (IsWindowBorderedByMod(hwnd)) {
-            ApplyHiddenBorderIndicator(hwnd, false);
-        }
-    } else if (IsWindowManagedByMod(hwnd)) {
-        ApplyHiddenBorderIndicator(hwnd, true);
-    }
-
-    return TRUE;
 }
 
 bool IsWindowCurrentlyHiddenFromCapture(HWND hwnd) {
@@ -1227,7 +1040,7 @@ ToggleResult ApplyDisplayAffinityForWindow(HWND hwnd,
                                            bool allowUnmanagedRestore = false) {
     hwnd = GetAncestor(hwnd, GA_ROOT);
     if (!IsWindow(hwnd)) {
-        Log(L"ApplyDisplayAffinityForWindow: invalid hwnd");
+        Wh_Log(L"ApplyDisplayAffinityForWindow: invalid hwnd");
         return ToggleResult::Failed;
     }
 
@@ -1242,16 +1055,16 @@ ToggleResult ApplyDisplayAffinityForWindow(HWND hwnd,
         DWORD originalAffinity = WDA_NONE;
         if (GetManagedWindowOriginalAffinity(hwnd, &originalAffinity)) {
             desiredAffinity = originalAffinity;
-            Log(L"ApplyDisplayAffinityForWindow: restoring managed hwnd=0x%p to originalAffinity=0x%08X",
+            Wh_Log(L"ApplyDisplayAffinityForWindow: restoring managed hwnd=0x%p to originalAffinity=0x%08X",
                 hwnd, originalAffinity);
         } else if (allowUnmanagedRestore &&
                    (currentAffinity == kWdaExcludeFromCapture ||
                     currentAffinity == kWdaMonitor)) {
             desiredAffinity = WDA_NONE;
-            Log(L"ApplyDisplayAffinityForWindow: restoring unmanaged hidden hwnd=0x%p to visible state",
+            Wh_Log(L"ApplyDisplayAffinityForWindow: restoring unmanaged hidden hwnd=0x%p to visible state",
                 hwnd);
         } else {
-            Log(L"ApplyDisplayAffinityForWindow: refusing to restore unmanaged hwnd=0x%p",
+            Wh_Log(L"ApplyDisplayAffinityForWindow: refusing to restore unmanaged hwnd=0x%p",
                 hwnd);
             return ToggleResult::Failed;
         }
@@ -1260,7 +1073,7 @@ ToggleResult ApplyDisplayAffinityForWindow(HWND hwnd,
         newlyManaged = true;
     }
 
-    Log(L"ApplyDisplayAffinityForWindow: hwnd=0x%p hide=%d currentAffinity=0x%08X desiredAffinity=0x%08X exStyle=0x%p",
+    Wh_Log(L"ApplyDisplayAffinityForWindow: hwnd=0x%p hide=%d currentAffinity=0x%08X desiredAffinity=0x%08X exStyle=0x%p",
         hwnd, hide ? 1 : 0, currentAffinity, desiredAffinity,
         reinterpret_cast<void*>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE)));
 
@@ -1272,7 +1085,7 @@ ToggleResult ApplyDisplayAffinityForWindow(HWND hwnd,
         } else {
             ApplyHiddenBorderIndicator(hwnd, true);
         }
-        Log(L"ApplyDisplayAffinityForWindow: SetWindowDisplayAffinity succeeded hwnd=0x%p result=%s",
+        Wh_Log(L"ApplyDisplayAffinityForWindow: SetWindowDisplayAffinity succeeded hwnd=0x%p result=%s",
             hwnd, hide ? L"Hidden" : L"Unhidden");
         return hide ? ToggleResult::Hidden : ToggleResult::Unhidden;
     }
@@ -1281,19 +1094,19 @@ ToggleResult ApplyDisplayAffinityForWindow(HWND hwnd,
     if (hide && newlyManaged) {
         ForgetManagedWindowAffinity(hwnd);
     }
-    Log(L"ApplyDisplayAffinityForWindow: SetWindowDisplayAffinity failed hwnd=0x%p gle=%lu",
+    Wh_Log(L"ApplyDisplayAffinityForWindow: SetWindowDisplayAffinity failed hwnd=0x%p gle=%lu",
         hwnd, initialError);
 
     if (hide) {
         if (SetWindowDisplayAffinity(hwnd, kWdaMonitor)) {
             ApplyHiddenBorderIndicator(hwnd, true);
-            Log(L"ApplyDisplayAffinityForWindow: compatibility fallback WDA_MONITOR succeeded hwnd=0x%p",
+            Wh_Log(L"ApplyDisplayAffinityForWindow: compatibility fallback WDA_MONITOR succeeded hwnd=0x%p",
                 hwnd);
             return ToggleResult::HiddenCompatibility;
         }
 
         const DWORD compatibilityError = GetLastError();
-        Log(L"ApplyDisplayAffinityForWindow: compatibility fallback WDA_MONITOR failed hwnd=0x%p gle=%lu exStyle=0x%p",
+        Wh_Log(L"ApplyDisplayAffinityForWindow: compatibility fallback WDA_MONITOR failed hwnd=0x%p gle=%lu exStyle=0x%p",
             hwnd, compatibilityError,
             reinterpret_cast<void*>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE)));
     }
@@ -1346,7 +1159,7 @@ ToggleResult ApplyDisplayAffinityForCurrentProcess(
                 reinterpret_cast<LPARAM>(&context));
 
     if (!context.anySucceeded) {
-        Log(L"ApplyDisplayAffinityForCurrentProcess: no eligible windows updated hide=%d pid=%lu",
+        Wh_Log(L"ApplyDisplayAffinityForCurrentProcess: no eligible windows updated hide=%d pid=%lu",
             hide ? 1 : 0, GetCurrentProcessId());
         return ToggleResult::Failed;
     }
@@ -1367,243 +1180,200 @@ ToggleResult ToggleDisplayAffinityForCurrentProcess(HWND sourceWindow) {
     const bool hide = !hasManagedWindows && !sourceHidden;
     const bool allowUnmanagedRestore = !hasManagedWindows && sourceHidden;
 
-    Log(L"ToggleDisplayAffinityForCurrentProcess: pid=%lu managed=%d source=0x%p sourceHidden=%d hide=%d allowUnmanagedRestore=%d",
+    Wh_Log(L"ToggleDisplayAffinityForCurrentProcess: pid=%lu managed=%d source=0x%p sourceHidden=%d hide=%d allowUnmanagedRestore=%d",
         GetCurrentProcessId(), hasManagedWindows ? 1 : 0, sourceWindow,
         sourceHidden ? 1 : 0, hide ? 1 : 0,
         allowUnmanagedRestore ? 1 : 0);
     return ApplyDisplayAffinityForCurrentProcess(hide, allowUnmanagedRestore);
 }
 
-LRESULT CALLBACK ToggleSubclassProc(HWND hwnd,
+std::wstring GetReceiverWindowName(DWORD pid) {
+    wchar_t name[96];
+    swprintf_s(name, L"Windhawk.HideFromScreenCapture.Receiver.%lu", pid);
+    return name;
+}
+
+LRESULT CALLBACK ReceiverWindowProc(HWND hwnd,
                                     UINT msg,
                                     WPARAM wParam,
                                     LPARAM lParam) {
-    EnsureToggleMessageRegistered();
-
-    WNDPROC originalWndProc = reinterpret_cast<WNDPROC>(
-        GetPropW(hwnd, kOriginalWndProcPropName));
-    if (!originalWndProc) {
-        originalWndProc = DefWindowProcW;
-    }
+    UNREFERENCED_PARAMETER(lParam);
 
     if (msg == g_toggleMessage) {
-        UNREFERENCED_PARAMETER(wParam);
-        UNREFERENCED_PARAMETER(lParam);
-        Log(L"ToggleSubclassProc: received toggle message hwnd=0x%p", hwnd);
+        if (g_unloading.load() || g_processIsProtected.load()) {
+            return static_cast<LRESULT>(ToggleResult::Failed);
+        }
+
+        HWND sourceWindow = reinterpret_cast<HWND>(wParam);
+        DWORD sourcePid = 0;
+        GetWindowThreadProcessId(sourceWindow, &sourcePid);
+        if (sourcePid != GetCurrentProcessId()) {
+            return static_cast<LRESULT>(ToggleResult::Failed);
+        }
+
+        Wh_Log(L"ReceiverWindowProc: received toggle source=0x%p pid=%lu",
+               sourceWindow, sourcePid);
         return static_cast<LRESULT>(
-            ToggleDisplayAffinityForCurrentProcess(hwnd));
+            ToggleDisplayAffinityForCurrentProcess(sourceWindow));
     }
 
-    if (msg == WM_NCDESTROY) {
-        if (IsWindowBorderedByMod(hwnd)) {
-            ApplyHiddenBorderIndicator(hwnd, false);
+    if (msg == kStopReceiverMessage) {
+        DestroyWindow(hwnd);
+        return 0;
+    }
+
+    if (msg == WM_DESTROY) {
+        if (g_receiverWindow.load() == hwnd) {
+            g_receiverWindow.store(nullptr);
         }
-        SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
-                          reinterpret_cast<LONG_PTR>(originalWndProc));
-        ForgetManagedWindowAffinity(hwnd);
-        ForgetManagedWindowBorder(hwnd);
-        RemovePropW(hwnd, kOriginalWndProcPropName);
-        RemovePropW(hwnd, kSubclassPropName);
+        PostQuitMessage(0);
+        return 0;
     }
 
-    return CallWindowProcW(originalWndProc, hwnd, msg, wParam, lParam);
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-bool MaybeSubclassWindow(HWND hwnd) {
-    if (!IsWindow(hwnd)) {
-        return false;
+DWORD WINAPI ReceiverThreadMain(LPVOID) {
+    HINSTANCE instance = reinterpret_cast<HINSTANCE>(&__ImageBase);
+    WNDCLASSW windowClass{};
+    windowClass.lpfnWndProc = ReceiverWindowProc;
+    windowClass.hInstance = instance;
+    windowClass.lpszClassName = kReceiverWindowClassName;
+
+    ATOM classAtom = RegisterClassW(&windowClass);
+    if (!classAtom && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        Wh_Log(L"ReceiverThreadMain: RegisterClassW failed gle=%lu",
+               GetLastError());
+        SetEvent(g_receiverReadyEvent);
+        return 0;
     }
 
-    if (g_processIsProtected.load()) {
-        return false;
-    }
-
-    if (!EnsureToggleMessageRegistered()) {
-        Log(L"MaybeSubclassWindow: toggle message unavailable hwnd=0x%p", hwnd);
-        return false;
-    }
-
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    if (pid != GetCurrentProcessId()) {
-        return false;
-    }
-
-    if (GetPropW(hwnd, kSubclassPropName)) {
-        return true;
-    }
-
-    if (!IsLikelyUserFacingPrimaryWindow(hwnd)) {
-        return false;
-    }
-
-    WNDPROC originalWndProc = reinterpret_cast<WNDPROC>(
-        GetWindowLongPtrW(hwnd, GWLP_WNDPROC));
-    if (!originalWndProc) {
-        Log(L"MaybeSubclassWindow: GetWindowLongPtrW(GWLP_WNDPROC) failed hwnd=0x%p gle=%lu",
-            hwnd, GetLastError());
-        return false;
-    }
-
-    if (!SetPropW(hwnd, kOriginalWndProcPropName,
-                  reinterpret_cast<HANDLE>(originalWndProc))) {
-        Log(L"MaybeSubclassWindow: SetPropW(original wndproc) failed hwnd=0x%p gle=%lu",
-            hwnd, GetLastError());
-        return false;
-    }
-
-    const LONG_PTR previousWndProc = SetWindowLongPtrW(
-        hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(ToggleSubclassProc));
-    if (!previousWndProc) {
-        const DWORD gle = GetLastError();
-        RemovePropW(hwnd, kOriginalWndProcPropName);
-        Log(L"MaybeSubclassWindow: SetWindowLongPtrW(GWLP_WNDPROC) failed hwnd=0x%p gle=%lu",
-            hwnd, gle);
-        return false;
-    }
-
-    if (!ChangeWindowMessageFilterEx(hwnd, g_toggleMessage, MSGFLT_ALLOW,
-                                     nullptr)) {
-        const DWORD gle = GetLastError();
-        Log(L"MaybeSubclassWindow: ChangeWindowMessageFilterEx failed hwnd=0x%p msg=0x%X gle=%lu",
-            hwnd, g_toggleMessage, gle);
-    } else {
-        Log(L"MaybeSubclassWindow: allowed toggle message through UIPI hwnd=0x%p msg=0x%X",
-            hwnd, g_toggleMessage);
-    }
-
-    SetPropW(hwnd, kSubclassPropName, reinterpret_cast<HANDLE>(1));
-    Log(L"MaybeSubclassWindow: subclassed hwnd=0x%p title='%s'", hwnd,
-        GetWindowTextString(hwnd).c_str());
-
-    if (IsProcessHiddenByMod()) {
-        const ToggleResult result = ApplyDisplayAffinityForWindow(hwnd, true);
-        Log(L"MaybeSubclassWindow: auto-applied hidden state to new window hwnd=0x%p result=%u",
-            hwnd, static_cast<unsigned>(result));
-    }
-    return true;
-}
-
-void MaybeUnsubclassWindow(HWND hwnd) {
-    if (GetPropW(hwnd, kSubclassPropName)) {
-        WNDPROC originalWndProc = reinterpret_cast<WNDPROC>(
-            GetPropW(hwnd, kOriginalWndProcPropName));
-        if (originalWndProc) {
-            SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
-                              reinterpret_cast<LONG_PTR>(originalWndProc));
-            RemovePropW(hwnd, kOriginalWndProcPropName);
+    const std::wstring windowName =
+        GetReceiverWindowName(GetCurrentProcessId());
+    HWND receiverWindow = CreateWindowExW(
+        0, kReceiverWindowClassName, windowName.c_str(), 0, 0, 0, 0, 0,
+        HWND_MESSAGE, nullptr, instance, nullptr);
+    g_receiverWindow.store(receiverWindow);
+    if (!receiverWindow) {
+        Wh_Log(L"ReceiverThreadMain: CreateWindowExW failed gle=%lu",
+               GetLastError());
+        if (classAtom) {
+            UnregisterClassW(kReceiverWindowClassName, instance);
         }
-        if (IsWindowBorderedByMod(hwnd)) {
-            ApplyHiddenBorderIndicator(hwnd, false);
-        }
-        ForgetManagedWindowAffinity(hwnd);
-        ForgetManagedWindowBorder(hwnd);
-        RemovePropW(hwnd, kSubclassPropName);
+        SetEvent(g_receiverReadyEvent);
+        return 0;
     }
+
+    if (!ChangeWindowMessageFilterEx(receiverWindow, g_toggleMessage,
+                                     MSGFLT_ALLOW, nullptr)) {
+        Wh_Log(L"ReceiverThreadMain: ChangeWindowMessageFilterEx failed msg=0x%X gle=%lu",
+               g_toggleMessage, GetLastError());
+    }
+
+    Wh_Log(L"ReceiverThreadMain: receiver ready hwnd=0x%p pid=%lu",
+           receiverWindow, GetCurrentProcessId());
+    SetEvent(g_receiverReadyEvent);
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if (receiverWindow && IsWindow(receiverWindow)) {
+        DestroyWindow(receiverWindow);
+    }
+    g_receiverWindow.store(nullptr);
+    UnregisterClassW(kReceiverWindowClassName, instance);
+    return 0;
 }
 
-BOOL CALLBACK EnumCurrentProcessWindows(HWND hwnd, LPARAM) {
-    MaybeSubclassWindow(hwnd);
-    return TRUE;
+bool StartReceiverThread() {
+    g_receiverReadyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_receiverReadyEvent) {
+        Wh_Log(L"StartReceiverThread: CreateEventW failed gle=%lu",
+               GetLastError());
+        return false;
+    }
+
+    g_receiverThread = CreateThread(nullptr, 0, ReceiverThreadMain, nullptr, 0,
+                                    &g_receiverThreadId);
+    if (!g_receiverThread) {
+        Wh_Log(L"StartReceiverThread: CreateThread failed gle=%lu",
+               GetLastError());
+        CloseHandle(g_receiverReadyEvent);
+        g_receiverReadyEvent = nullptr;
+        return false;
+    }
+
+    WaitForSingleObject(g_receiverReadyEvent, INFINITE);
+    CloseHandle(g_receiverReadyEvent);
+    g_receiverReadyEvent = nullptr;
+    return g_receiverWindow.load() != nullptr;
 }
 
-BOOL CALLBACK EnumCurrentProcessWindowsForUnsubclass(HWND hwnd, LPARAM) {
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    if (pid == GetCurrentProcessId()) {
-        MaybeUnsubclassWindow(hwnd);
+void StopReceiverThread() {
+    HWND receiverWindow = g_receiverWindow.load();
+    if (receiverWindow) {
+        PostMessageW(receiverWindow, kStopReceiverMessage, 0, 0);
+    } else if (g_receiverThreadId) {
+        PostThreadMessageW(g_receiverThreadId, WM_QUIT, 0, 0);
     }
-    return TRUE;
-}
 
-HWND WINAPI CreateWindowExW_Hook(DWORD exStyle,
-                                 LPCWSTR className,
-                                 LPCWSTR windowName,
-                                 DWORD style,
-                                 int x,
-                                 int y,
-                                 int width,
-                                 int height,
-                                 HWND parent,
-                                 HMENU menu,
-                                 HINSTANCE instance,
-                                 LPVOID param) {
-    HWND hwnd = g_originalCreateWindowExW(exStyle, className, windowName, style,
-                                          x, y, width, height, parent, menu,
-                                          instance, param);
-    if (hwnd) {
-        MaybeSubclassWindow(hwnd);
+    if (g_receiverThread) {
+        WaitForSingleObject(g_receiverThread, INFINITE);
+        CloseHandle(g_receiverThread);
+        g_receiverThread = nullptr;
     }
-    return hwnd;
+    g_receiverThreadId = 0;
+    g_receiverWindow.store(nullptr);
 }
 
 bool SendToggleMessageToWindow(HWND hwnd,
                                ToggleResult* resultOut,
                                std::wstring* displayNameOut) {
     if (!EnsureToggleMessageRegistered()) {
-        Log(L"SendToggleMessageToWindow: toggle message unavailable");
+        Wh_Log(L"SendToggleMessageToWindow: toggle message unavailable");
         return false;
     }
 
     hwnd = GetAncestor(hwnd, GA_ROOT);
     if (!IsWindow(hwnd)) {
-        Log(L"SendToggleMessageToWindow: invalid hwnd");
+        Wh_Log(L"SendToggleMessageToWindow: invalid hwnd");
         return false;
     }
 
-    auto trySend = [&](HWND candidate, ULONG_PTR* result) {
-        Log(L"SendToggleMessageToWindow: sending hwnd=0x%p title='%s'",
-            candidate, GetWindowTextString(candidate).c_str());
-        return SendMessageTimeoutW(candidate, g_toggleMessage, 0, 0,
-                                   SMTO_ABORTIFHUNG | SMTO_BLOCK,
-                                   kToggleSendTimeoutMs, result) != 0;
-    };
-
-    ULONG_PTR result = 0;
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
-
-    ProcessMessageTargetContext context;
-    context.pid = pid;
-    context.preferred = hwnd;
-    EnumWindows(EnumWindowsForProcessMessageTarget,
-                reinterpret_cast<LPARAM>(&context));
-
-    bool delivered = trySend(hwnd, &result);
-    bool usedFallback = false;
-    if ((!delivered || result == static_cast<ULONG_PTR>(ToggleResult::Failed)) &&
-        context.fallback) {
-        ULONG_PTR fallbackResult = 0;
-        if (trySend(context.fallback, &fallbackResult)) {
-            delivered = true;
-            result = fallbackResult;
-            usedFallback = true;
-        }
-    }
-
-    if (!delivered) {
-        const DWORD sendError = GetLastError();
-        Log(L"SendToggleMessageToWindow: SendMessageTimeoutW failed hwnd=0x%p fallback=0x%p gle=%lu",
-            hwnd, context.fallback, sendError);
+    const std::wstring receiverName = GetReceiverWindowName(pid);
+    HWND receiver = FindWindowExW(HWND_MESSAGE, nullptr,
+                                  kReceiverWindowClassName,
+                                  receiverName.c_str());
+    if (!receiver) {
+        Wh_Log(L"SendToggleMessageToWindow: receiver not found pid=%lu",
+               pid);
         return false;
     }
 
-    if (usedFallback) {
-        Log(L"SendToggleMessageToWindow: fallback hwnd=0x%p handled toggle for pid=%lu result=%llu",
-            context.fallback, pid, static_cast<unsigned long long>(result));
+    ULONG_PTR result = 0;
+    if (!SendMessageTimeoutW(receiver, g_toggleMessage,
+                             reinterpret_cast<WPARAM>(hwnd), 0,
+                             SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                             kToggleSendTimeoutMs, &result)) {
+        Wh_Log(L"SendToggleMessageToWindow: send failed receiver=0x%p pid=%lu gle=%lu",
+               receiver, pid, GetLastError());
+        return false;
     }
 
     if (resultOut) {
         *resultOut = static_cast<ToggleResult>(result);
     }
-
     if (displayNameOut) {
         *displayNameOut = DescribeWindowForUser(hwnd);
     }
 
-    Log(L"SendToggleMessageToWindow: hwnd=0x%p result=%llu", hwnd,
-        static_cast<unsigned long long>(result));
-
+    Wh_Log(L"SendToggleMessageToWindow: receiver=0x%p pid=%lu result=%llu",
+           receiver, pid, static_cast<unsigned long long>(result));
     return true;
 }
 
@@ -1615,11 +1385,11 @@ void NotifyToggleResult(const std::wstring& label, ToggleResult result) {
         case ToggleResult::Unhidden:
             return;
         case ToggleResult::HiddenCompatibility:
-            Log(L"NotifyToggleResult: compatibility mode for '%s'",
+            Wh_Log(L"NotifyToggleResult: compatibility mode for '%s'",
                 visibleLabel.c_str());
             break;
         default:
-            Log(L"NotifyToggleResult: failed for '%s'", visibleLabel.c_str());
+            Wh_Log(L"NotifyToggleResult: failed for '%s'", visibleLabel.c_str());
             break;
     }
 }
@@ -1631,23 +1401,23 @@ bool ToggleWindowFromTaskbarPoint(POINT pt, bool* swallowed) {
 
     HWND taskbarRoot = nullptr;
     if (!IsPointOnTaskbar(pt, &taskbarRoot) || !taskbarRoot) {
-        Log(L"ToggleWindowFromTaskbarPoint: point wasn't on taskbar");
+        Wh_Log(L"ToggleWindowFromTaskbarPoint: point wasn't on taskbar");
         return false;
     }
 
-    Log(L"ToggleWindowFromTaskbarPoint: taskbar hit root=0x%p", taskbarRoot);
+    Wh_Log(L"ToggleWindowFromTaskbarPoint: taskbar hit root=0x%p", taskbarRoot);
 
     HWND targetWindow = nullptr;
     std::wstring taskbarLabel;
     if (!ResolveTaskbarButtonTargetWindow(pt, &targetWindow, &taskbarLabel) ||
         !targetWindow) {
-        Log(L"ToggleWindowFromTaskbarPoint: failed to resolve taskbar button target");
+        Wh_Log(L"ToggleWindowFromTaskbarPoint: failed to resolve taskbar button target");
         return false;
     }
 
     std::wstring protectedImagePath;
     if (IsProtectedWindowTarget(targetWindow, &protectedImagePath)) {
-        Log(L"ToggleWindowFromTaskbarPoint: protected target hwnd=0x%p path='%s'",
+        Wh_Log(L"ToggleWindowFromTaskbarPoint: protected target hwnd=0x%p path='%s'",
             targetWindow, protectedImagePath.c_str());
         if (swallowed) {
             *swallowed = true;
@@ -1655,13 +1425,13 @@ bool ToggleWindowFromTaskbarPoint(POINT pt, bool* swallowed) {
         return true;
     }
 
-    Log(L"ToggleWindowFromTaskbarPoint: resolved target hwnd=0x%p label='%s'",
+    Wh_Log(L"ToggleWindowFromTaskbarPoint: resolved target hwnd=0x%p label='%s'",
         targetWindow, taskbarLabel.c_str());
 
     ToggleResult result = ToggleResult::Failed;
     std::wstring actualWindowLabel;
     if (!SendToggleMessageToWindow(targetWindow, &result, &actualWindowLabel)) {
-        Log(L"ToggleWindowFromTaskbarPoint: send toggle message failed hwnd=0x%p",
+        Wh_Log(L"ToggleWindowFromTaskbarPoint: send toggle message failed hwnd=0x%p",
             targetWindow);
         NotifyToggleResult(taskbarLabel, ToggleResult::Failed);
         if (swallowed) {
@@ -1670,7 +1440,7 @@ bool ToggleWindowFromTaskbarPoint(POINT pt, bool* swallowed) {
         return true;
     }
 
-    Log(L"ToggleWindowFromTaskbarPoint: toggle completed hwnd=0x%p result=%u actualLabel='%s'",
+    Wh_Log(L"ToggleWindowFromTaskbarPoint: toggle completed hwnd=0x%p result=%u actualLabel='%s'",
         targetWindow, static_cast<unsigned>(result), actualWindowLabel.c_str());
 
     NotifyToggleResult(!actualWindowLabel.empty() ? actualWindowLabel
@@ -1693,28 +1463,21 @@ LRESULT CALLBACK ExplorerMouseHookProc(int code, WPARAM wParam, LPARAM lParam) {
     }
 
     if (wParam == WM_MBUTTONUP) {
-        const DWORD swallowStart = g_swallowStartTick.load();
+        const DWORD swallowStart = g_swallowStartTick.exchange(0);
         if (swallowStart && GetTickCount() - swallowStart <= kSwallowWindowMs) {
-            g_swallowStartTick.store(0);
             return 1;
         }
-        g_swallowStartTick.store(0);
         return CallNextHookEx(g_explorerMouseHook, code, wParam, lParam);
     }
 
-    if (wParam != WM_MBUTTONDOWN) {
+    if (wParam != WM_MBUTTONDOWN || !TriggerModeHasMouse() ||
+        !IsModifierSatisfied() || !IsPointOnTaskbar(mouse->pt, nullptr)) {
         return CallNextHookEx(g_explorerMouseHook, code, wParam, lParam);
     }
 
-    if (!TriggerModeHasMouse() || !IsModifierSatisfied()) {
-        return CallNextHookEx(g_explorerMouseHook, code, wParam, lParam);
-    }
-
-    Log(L"ExplorerMouseHookProc: WM_MBUTTONDOWN at (%ld,%ld)", mouse->pt.x,
-        mouse->pt.y);
-
-    bool swallowed = false;
-    if (!ToggleWindowFromTaskbarPoint(mouse->pt, &swallowed) || !swallowed) {
+    if (!PostThreadMessageW(g_explorerHookThreadId, kExplorerToggleMessage,
+                            static_cast<WPARAM>(mouse->pt.x),
+                            static_cast<LPARAM>(mouse->pt.y))) {
         return CallNextHookEx(g_explorerMouseHook, code, wParam, lParam);
     }
 
@@ -1730,17 +1493,16 @@ LRESULT CALLBACK ExplorerKeyboardHookProc(int code,
     }
 
     auto* keyboard = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
-    if (!keyboard) {
-        return CallNextHookEx(g_explorerKeyboardHook, code, wParam, lParam);
-    }
-
-    const int configuredVk = GetConfiguredHotkeyVk();
-    if (static_cast<int>(keyboard->vkCode) != configuredVk) {
+    if (!keyboard ||
+        static_cast<int>(keyboard->vkCode) != GetConfiguredHotkeyVk()) {
         return CallNextHookEx(g_explorerKeyboardHook, code, wParam, lParam);
     }
 
     if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
         g_hotkeyDown.store(false);
+        if (g_hotkeySwallowed.exchange(false)) {
+            return 1;
+        }
         return CallNextHookEx(g_explorerKeyboardHook, code, wParam, lParam);
     }
 
@@ -1749,32 +1511,43 @@ LRESULT CALLBACK ExplorerKeyboardHookProc(int code,
     }
 
     if (g_hotkeyDown.exchange(true)) {
+        if (g_hotkeySwallowed.load()) {
+            return 1;
+        }
         return CallNextHookEx(g_explorerKeyboardHook, code, wParam, lParam);
     }
 
     POINT pt{};
-    if (!GetCursorPos(&pt)) {
+    if (!GetCursorPos(&pt) || !IsPointOnTaskbar(pt, nullptr)) {
         return CallNextHookEx(g_explorerKeyboardHook, code, wParam, lParam);
     }
 
-    bool swallowed = false;
-    if (ToggleWindowFromTaskbarPoint(pt, &swallowed) && swallowed) {
-        return 1;
+    if (!PostThreadMessageW(g_explorerHookThreadId, kExplorerToggleMessage,
+                            static_cast<WPARAM>(pt.x),
+                            static_cast<LPARAM>(pt.y))) {
+        return CallNextHookEx(g_explorerKeyboardHook, code, wParam, lParam);
     }
 
-    return CallNextHookEx(g_explorerKeyboardHook, code, wParam, lParam);
+    g_hotkeySwallowed.store(true);
+    return 1;
 }
 
 void EnsureExplorerHooksInstalled(HMODULE thisModule) {
-    if (!g_explorerMouseHook) {
+    if (!TriggerModeHasMouse()) {
+        if (g_explorerMouseHook) {
+            UnhookWindowsHookEx(g_explorerMouseHook);
+            g_explorerMouseHook = nullptr;
+            Wh_Log(L"EnsureExplorerHooksInstalled: low-level mouse hook removed");
+        }
+    } else if (!g_explorerMouseHook) {
         g_explorerMouseHook = SetWindowsHookExW(WH_MOUSE_LL,
                                                 ExplorerMouseHookProc,
                                                 thisModule, 0);
         if (!g_explorerMouseHook) {
-            Log(L"EnsureExplorerHooksInstalled: SetWindowsHookExW mouse failed gle=%lu",
+            Wh_Log(L"EnsureExplorerHooksInstalled: SetWindowsHookExW mouse failed gle=%lu",
                 GetLastError());
         } else {
-            Log(L"EnsureExplorerHooksInstalled: low-level mouse hook installed");
+            Wh_Log(L"EnsureExplorerHooksInstalled: low-level mouse hook installed");
         }
     }
 
@@ -1782,7 +1555,7 @@ void EnsureExplorerHooksInstalled(HMODULE thisModule) {
         if (g_explorerKeyboardHook) {
             UnhookWindowsHookEx(g_explorerKeyboardHook);
             g_explorerKeyboardHook = nullptr;
-            Log(L"EnsureExplorerHooksInstalled: low-level keyboard hook removed");
+            Wh_Log(L"EnsureExplorerHooksInstalled: low-level keyboard hook removed");
         }
         return;
     }
@@ -1792,10 +1565,10 @@ void EnsureExplorerHooksInstalled(HMODULE thisModule) {
                                                    ExplorerKeyboardHookProc,
                                                    thisModule, 0);
         if (!g_explorerKeyboardHook) {
-            Log(L"EnsureExplorerHooksInstalled: SetWindowsHookExW keyboard failed gle=%lu",
+            Wh_Log(L"EnsureExplorerHooksInstalled: SetWindowsHookExW keyboard failed gle=%lu",
                 GetLastError());
         } else {
-            Log(L"EnsureExplorerHooksInstalled: low-level keyboard hook installed");
+            Wh_Log(L"EnsureExplorerHooksInstalled: low-level keyboard hook installed");
         }
     }
 }
@@ -1803,10 +1576,7 @@ void EnsureExplorerHooksInstalled(HMODULE thisModule) {
 DWORD WINAPI ExplorerHookThreadMain(LPVOID) {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     const bool uninitCo = SUCCEEDED(hr);
-    Log(L"ExplorerHookThreadMain: starting CoInitializeEx hr=0x%08X", hr);
-
-    INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_STANDARD_CLASSES};
-    InitCommonControlsEx(&icc);
+    Wh_Log(L"ExplorerHookThreadMain: starting CoInitializeEx hr=0x%08X", hr);
 
     EnsureToggleMessageRegistered();
 
@@ -1822,6 +1592,13 @@ DWORD WINAPI ExplorerHookThreadMain(LPVOID) {
             EnsureExplorerHooksInstalled(thisModule);
             continue;
         }
+        if (msg.message == kExplorerToggleMessage) {
+            POINT pt{static_cast<LONG>(msg.wParam),
+                     static_cast<LONG>(msg.lParam)};
+            bool swallowed = false;
+            ToggleWindowFromTaskbarPoint(pt, &swallowed);
+            continue;
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -1831,13 +1608,13 @@ DWORD WINAPI ExplorerHookThreadMain(LPVOID) {
     if (g_explorerMouseHook) {
         UnhookWindowsHookEx(g_explorerMouseHook);
         g_explorerMouseHook = nullptr;
-        Log(L"ExplorerHookThreadMain: low-level mouse hook removed");
+        Wh_Log(L"ExplorerHookThreadMain: low-level mouse hook removed");
     }
 
     if (g_explorerKeyboardHook) {
         UnhookWindowsHookEx(g_explorerKeyboardHook);
         g_explorerKeyboardHook = nullptr;
-        Log(L"ExplorerHookThreadMain: low-level keyboard hook removed");
+        Wh_Log(L"ExplorerHookThreadMain: low-level keyboard hook removed");
     }
 
     g_uia.Reset();
@@ -1857,26 +1634,22 @@ bool IsCurrentProcessExplorer() {
     return fileName && _wcsicmp(fileName, L"explorer.exe") == 0;
 }
 
-void InstallPerProcessHooks() {
-    EnsureToggleMessageRegistered();
-    Log(L"InstallPerProcessHooks: pid=%lu explorer=%d toggleMessage=0x%X",
-        GetCurrentProcessId(), g_processIsExplorer.load() ? 1 : 0,
-        g_toggleMessage);
-
-    HMODULE user32 = GetModuleHandleW(L"user32.dll");
-    if (user32) {
-        void* createWindowExAddress =
-            reinterpret_cast<void*>(GetProcAddress(user32, "CreateWindowExW"));
-        if (createWindowExAddress) {
-            Wh_SetFunctionHook(createWindowExAddress,
-                               reinterpret_cast<void*>(CreateWindowExW_Hook),
-                               reinterpret_cast<void**>(&g_originalCreateWindowExW));
-            Log(L"InstallPerProcessHooks: CreateWindowExW hook requested");
-        }
+void InstallPerProcessReceiver() {
+    if (!EnsureToggleMessageRegistered()) {
+        Wh_Log(L"InstallPerProcessReceiver: toggle message unavailable");
+        return;
     }
 
-    EnumWindows(EnumCurrentProcessWindows, 0);
-    Log(L"InstallPerProcessHooks: initial top-level window enumeration complete");
+    if (g_processIsProtected.load()) {
+        Wh_Log(L"InstallPerProcessReceiver: skipped protected pid=%lu",
+               GetCurrentProcessId());
+        return;
+    }
+
+    if (!StartReceiverThread()) {
+        Wh_Log(L"InstallPerProcessReceiver: receiver startup failed pid=%lu",
+               GetCurrentProcessId());
+    }
 }
 
 }
@@ -1886,17 +1659,17 @@ BOOL Wh_ModInit() {
     g_processIsExplorer.store(IsCurrentProcessExplorer());
     g_processIsProtected.store(
         IsProtectedProcessPath(GetProcessImagePathForPid(GetCurrentProcessId())));
-    Log(L"Wh_ModInit: pid=%lu explorer=%d protected=%d",
+    Wh_Log(L"Wh_ModInit: pid=%lu explorer=%d protected=%d",
         GetCurrentProcessId(), g_processIsExplorer.load() ? 1 : 0,
         g_processIsProtected.load() ? 1 : 0);
-    InstallPerProcessHooks();
+    InstallPerProcessReceiver();
 
     if (g_processIsExplorer.load()) {
         g_unloading.store(false);
         g_explorerHookThread =
             CreateThread(nullptr, 0, ExplorerHookThreadMain, nullptr, 0,
                          &g_explorerHookThreadId);
-        Log(L"Wh_ModInit: explorer hook thread handle=0x%p tid=%lu",
+        Wh_Log(L"Wh_ModInit: explorer hook thread handle=0x%p tid=%lu",
             g_explorerHookThread, g_explorerHookThreadId);
     }
 
@@ -1905,7 +1678,7 @@ BOOL Wh_ModInit() {
 
 void Wh_ModUninit() {
     g_unloading.store(true);
-    Log(L"Wh_ModUninit: pid=%lu explorer=%d", GetCurrentProcessId(),
+    Wh_Log(L"Wh_ModUninit: pid=%lu explorer=%d", GetCurrentProcessId(),
         g_processIsExplorer.load() ? 1 : 0);
 
     if (g_explorerHookThreadId) {
@@ -1913,19 +1686,16 @@ void Wh_ModUninit() {
     }
 
     if (g_explorerHookThread) {
-        WaitForSingleObject(g_explorerHookThread, 3000);
+        WaitForSingleObject(g_explorerHookThread, INFINITE);
         CloseHandle(g_explorerHookThread);
         g_explorerHookThread = nullptr;
         g_explorerHookThreadId = 0;
     }
 
-    if (!g_processIsExplorer.load() && IsProcessHiddenByMod()) {
-        Log(L"Wh_ModUninit: restoring all windows for pid=%lu",
-            GetCurrentProcessId());
-        ApplyDisplayAffinityForCurrentProcess(false);
-    }
-
-    EnumWindows(EnumCurrentProcessWindowsForUnsubclass, 0);
+    StopReceiverThread();
+    Wh_Log(L"Wh_ModUninit: restoring all eligible windows for pid=%lu",
+           GetCurrentProcessId());
+    ApplyDisplayAffinityForCurrentProcess(false);
 }
 
 BOOL Wh_ModSettingsChanged(BOOL* bReload) {
@@ -1933,6 +1703,6 @@ BOOL Wh_ModSettingsChanged(BOOL* bReload) {
         *bReload = TRUE;
     }
 
-    Log(L"Wh_ModSettingsChanged: reloading");
+    Wh_Log(L"Wh_ModSettingsChanged: reloading");
     return TRUE;
 }
