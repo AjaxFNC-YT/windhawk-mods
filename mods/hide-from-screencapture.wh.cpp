@@ -1,10 +1,10 @@
 // ==WindhawkMod==
-// @id              hide-from-screenshare
+// @id              hide-from-screencapture
 // @name            Capture Toggle
 // @description     Toggle screen-capture exclusion for Windows 11 taskbar apps, with protected-app blocking and an optional hidden-window border.
 // @version         1.0.0
 // @author          AjaxFNC
-// @github          AjaxFNC-YT
+// @github          https://github.com/AjaxFNC-YT
 // @architecture    x86-64
 // @include         *
 // @compilerOptions -lole32 -loleaut32 -luuid -lshell32 -lpropsys -lruntimeobject -luiautomationcore -lcomctl32 -ldwmapi -lshlwapi
