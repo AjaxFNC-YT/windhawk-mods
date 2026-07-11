@@ -148,7 +148,6 @@ struct WindowCandidate {
     std::wstring exeBaseName;
     std::wstring appUserModelId;
     int score = 0;
-    bool foregroundProcess = false;
 };
 
 enum class TriggerMode {
@@ -688,11 +687,14 @@ HWND TryGetDirectWindowFromElement(IUIAutomationElement* element,
 }
 
 int ScoreCandidate(const WindowCandidate& candidate,
-                   const UiaButtonDescriptor& descriptor,
-                   DWORD foregroundPid) {
+                   const UiaButtonDescriptor& descriptor) {
     int score = 0;
     const std::wstring title = candidate.title;
-    const std::wstring exeBase = candidate.exeBaseName;
+    std::wstring exeBase = candidate.exeBaseName;
+    const size_t extension = exeBase.find_last_of(L'.');
+    if (extension != std::wstring::npos) {
+        exeBase.resize(extension);
+    }
     const std::wstring appId = candidate.appUserModelId;
 
     if (!descriptor.name.empty()) {
@@ -732,14 +734,6 @@ int ScoreCandidate(const WindowCandidate& candidate,
         }
     }
 
-    if (candidate.pid == foregroundPid) {
-        score += 25;
-    }
-
-    if (GetForegroundWindow() == candidate.hwnd) {
-        score += 20;
-    }
-
     if (!title.empty()) {
         score += 10;
     }
@@ -749,7 +743,6 @@ int ScoreCandidate(const WindowCandidate& candidate,
 
 struct FindWindowContext {
     UiaButtonDescriptor descriptor;
-    DWORD foregroundPid = 0;
     WindowCandidate best;
 };
 
@@ -771,9 +764,7 @@ BOOL CALLBACK EnumWindowsForTaskbarMatch(HWND hwnd, LPARAM lParam) {
     candidate.title = GetWindowTextString(hwnd);
     candidate.exeBaseName = GetModuleBaseNameForPid(pid);
     candidate.appUserModelId = GetWindowAppUserModelId(hwnd);
-    candidate.foregroundProcess = (pid == context->foregroundPid);
-    candidate.score = ScoreCandidate(candidate, context->descriptor,
-                                     context->foregroundPid);
+    candidate.score = ScoreCandidate(candidate, context->descriptor);
 
     if (candidate.score > context->best.score) {
         context->best = candidate;
@@ -893,15 +884,8 @@ bool ResolveTaskbarButtonTargetWindow(POINT pt,
         return false;
     }
 
-    DWORD foregroundPid = 0;
-    HWND foregroundWindow = GetForegroundWindow();
-    if (foregroundWindow) {
-        GetWindowThreadProcessId(foregroundWindow, &foregroundPid);
-    }
-
     FindWindowContext context;
     context.descriptor = bestDescriptor;
-    context.foregroundPid = foregroundPid;
     EnumWindows(EnumWindowsForTaskbarMatch, reinterpret_cast<LPARAM>(&context));
 
     if (!context.best.hwnd || context.best.score < 35) {
@@ -942,11 +926,6 @@ bool IsWindowManagedByMod(HWND hwnd) {
     std::scoped_lock lock(g_windowAffinityMutex);
     return g_managedWindowOriginalAffinity.find(hwnd) !=
            g_managedWindowOriginalAffinity.end();
-}
-
-bool IsWindowBorderedByMod(HWND hwnd) {
-    std::scoped_lock lock(g_windowAffinityMutex);
-    return g_windowsWithHiddenBorder.find(hwnd) != g_windowsWithHiddenBorder.end();
 }
 
 bool HasManagedWindows() {
