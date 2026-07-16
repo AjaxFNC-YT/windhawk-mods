@@ -6,6 +6,16 @@
 // @author          AjaxFNC
 // @github          https://github.com/AjaxFNC-YT
 // @include         *
+// @exclude         valorant-win64-shipping.exe
+// @exclude         fortniteclient-win64-shipping.exe
+// @exclude         easyanticheat.exe
+// @exclude         easyanticheat_eos.exe
+// @exclude         beservice.exe
+// @exclude         beservice_x64.exe
+// @exclude         vgc.exe
+// @exclude         vgtray.exe
+// @exclude         riotclientservices.exe
+// @exclude         start_protected_game.exe
 // @compilerOptions -lole32 -loleaut32 -luuid -lshell32 -ldwmapi -lshlwapi
 // ==/WindhawkMod==
 
@@ -19,12 +29,14 @@ Using capture-hiding on games can cause instability, crashes, or even
 anti-cheat trouble such as an in-game ban. Windhawk decides which processes the
 mod is injected into before this mod's code runs.
 
-This mod's best-effort protected list only blocks the capture-hide action for
-common anti-cheat environments such as Riot Vanguard, Easy Anti-Cheat,
-Easy Anti-Cheat EOS, and BattlEye, along with known protected executables. It
-does not prevent Windhawk from injecting the mod. Windhawk excludes many common
-game and anti-cheat locations globally, but a non-standard install might still
-be injected. Neither mechanism detects every configuration or guarantees safety.
+The metadata excludes several known anti-cheat executables from injection, and
+Windhawk globally excludes many common game and anti-cheat installation paths.
+These exclusions are best-effort: renamed executables, other anti-cheat
+components, and games in non-standard locations may still be injected.
+
+The protected-app setting below is a separate guard which runs only after the
+mod has already been injected. It can block the capture-hide action, but it
+cannot prevent or undo injection and is not an anti-cheat safety guarantee.
 
 You can disable the protection list in the mod settings, but targeting games can
 still cause crashes, anti-cheat problems, or in-game bans.
@@ -91,6 +103,7 @@ most likely broken.
 #define WINRT_LEAN_AND_MEAN
 
 #include <windows.h>
+#include <appmodel.h>
 #include <dwmapi.h>
 #include <shlwapi.h>
 #include <uiautomation.h>
@@ -639,18 +652,113 @@ HWND TryGetDirectWindowFromElement(IUIAutomationElement* element,
 
 HWND TryGetWindowFromAutomationId(const std::wstring& automationId,
                                   HWND taskbarRoot) {
-    void* parsedHandle = nullptr;
-    if (swscanf_s(automationId.c_str(), L"Window: %p", &parsedHandle) != 1) {
+    constexpr wchar_t prefix[] = L"Window:";
+    if (_wcsnicmp(automationId.c_str(), prefix, ARRAYSIZE(prefix) - 1) != 0) {
         return nullptr;
     }
 
-    HWND hwnd = reinterpret_cast<HWND>(parsedHandle);
+    const wchar_t* value = automationId.c_str() + ARRAYSIZE(prefix) - 1;
+    while (iswspace(*value)) {
+        ++value;
+    }
+    wchar_t* end = nullptr;
+    const unsigned long long rawHandle = wcstoull(value, &end, 0);
+    while (end && iswspace(*end)) {
+        ++end;
+    }
+    if (!rawHandle || end == value || (end && *end)) {
+        return nullptr;
+    }
+
+    HWND hwnd = reinterpret_cast<HWND>(
+        static_cast<ULONG_PTR>(rawHandle));
     HWND root = GetAncestor(hwnd, GA_ROOT);
     if (!root || root == taskbarRoot || IsTaskbarHostWindow(root)) {
         return nullptr;
     }
 
     return IsCandidateTopLevelWindow(root) ? root : nullptr;
+}
+
+std::wstring GetProcessAppUserModelId(DWORD pid) {
+    std::wstring appId;
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) {
+        return appId;
+    }
+
+    UINT length = 0;
+    LONG result = GetApplicationUserModelId(process, &length, nullptr);
+    if (result == ERROR_INSUFFICIENT_BUFFER && length > 1) {
+        std::wstring buffer(length, L'\0');
+        result = GetApplicationUserModelId(process, &length, buffer.data());
+        if (result == ERROR_SUCCESS) {
+            if (length && buffer[length - 1] == L'\0') {
+                --length;
+            }
+            buffer.resize(length);
+            appId = std::move(buffer);
+        }
+    }
+
+    CloseHandle(process);
+    return appId;
+}
+
+std::wstring GetAppIdFromAutomationId(const std::wstring& automationId) {
+    constexpr wchar_t prefix[] = L"Appid:";
+    if (_wcsnicmp(automationId.c_str(), prefix, ARRAYSIZE(prefix) - 1) != 0) {
+        return L"";
+    }
+
+    const wchar_t* value = automationId.c_str() + ARRAYSIZE(prefix) - 1;
+    while (iswspace(*value)) {
+        ++value;
+    }
+    return value;
+}
+
+struct ExactAppIdMatchContext {
+    std::wstring appId;
+    HWND firstWindow = nullptr;
+    DWORD matchedPid = 0;
+    bool ambiguous = false;
+};
+
+BOOL CALLBACK EnumWindowsForExactAppIdMatch(HWND hwnd, LPARAM lParam) {
+    auto* context = reinterpret_cast<ExactAppIdMatchContext*>(lParam);
+    if (!context || !IsLikelyUserFacingPrimaryWindow(hwnd)) {
+        return TRUE;
+    }
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (!pid || pid == GetCurrentProcessId() ||
+        _wcsicmp(GetProcessAppUserModelId(pid).c_str(),
+                 context->appId.c_str()) != 0) {
+        return TRUE;
+    }
+
+    if (!context->matchedPid) {
+        context->matchedPid = pid;
+        context->firstWindow = hwnd;
+    } else if (context->matchedPid != pid) {
+        context->ambiguous = true;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+HWND TryGetWindowFromExactAppId(const std::wstring& automationId) {
+    ExactAppIdMatchContext context;
+    context.appId = GetAppIdFromAutomationId(automationId);
+    if (context.appId.empty()) {
+        return nullptr;
+    }
+
+    EnumWindows(EnumWindowsForExactAppIdMatch,
+                reinterpret_cast<LPARAM>(&context));
+    return !context.ambiguous ? context.firstWindow : nullptr;
 }
 
 std::wstring NormalizeIdentityText(const std::wstring& value) {
@@ -761,6 +869,47 @@ HWND TryGetUniqueProcessWindowFromDescriptor(
     return !context.ambiguous ? context.firstWindow : nullptr;
 }
 
+struct UniqueHiddenProcessContext {
+    HWND firstWindow = nullptr;
+    DWORD matchedPid = 0;
+    bool ambiguous = false;
+};
+
+BOOL CALLBACK EnumWindowsForUniqueHiddenProcess(HWND hwnd, LPARAM lParam) {
+    auto* context = reinterpret_cast<UniqueHiddenProcessContext*>(lParam);
+    if (!context || !IsLikelyUserFacingPrimaryWindow(hwnd)) {
+        return TRUE;
+    }
+
+    DWORD affinity = WDA_NONE;
+    if (!GetWindowDisplayAffinity(hwnd, &affinity) ||
+        (affinity != kWdaExcludeFromCapture && affinity != kWdaMonitor)) {
+        return TRUE;
+    }
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (!pid || pid == GetCurrentProcessId()) {
+        return TRUE;
+    }
+
+    if (!context->matchedPid) {
+        context->matchedPid = pid;
+        context->firstWindow = hwnd;
+    } else if (context->matchedPid != pid) {
+        context->ambiguous = true;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+HWND TryGetOnlyCaptureHiddenProcessWindow() {
+    UniqueHiddenProcessContext context;
+    EnumWindows(EnumWindowsForUniqueHiddenProcess,
+                reinterpret_cast<LPARAM>(&context));
+    return !context.ambiguous ? context.firstWindow : nullptr;
+}
+
 std::wstring DescribeWindowForUser(HWND hwnd);
 
 bool ResolveTaskbarButtonTargetWindow(POINT pt,
@@ -859,6 +1008,19 @@ bool ResolveTaskbarButtonTargetWindow(POINT pt,
             return true;
         }
 
+        if (HWND appIdWindow =
+                TryGetWindowFromExactAppId(descriptor.automationId)) {
+            *targetWindow = appIdWindow;
+            if (displayName) {
+                *displayName = DescribeWindowForUser(appIdWindow);
+            }
+            DWORD pid = 0;
+            GetWindowThreadProcessId(appIdWindow, &pid);
+            Wh_Log(L"ResolveTaskbarButtonTargetWindow: exact AppUserModelID match -> hwnd=0x%p pid=%lu automationId='%s'",
+                appIdWindow, pid, descriptor.automationId.c_str());
+            return true;
+        }
+
         if (bestDescriptor.name.empty() &&
             LooksLikeTaskbarButtonElement(descriptor,
                                           GetElementControlType(current.Get()))) {
@@ -892,6 +1054,25 @@ bool ResolveTaskbarButtonTargetWindow(POINT pt,
             uniqueProcessWindow, pid,
             displayName ? displayName->c_str() : L"");
         return true;
+    }
+
+    // UIA can occasionally return an empty taskbar element. Only use this
+    // recovery path to unhide: never choose an ordinary visible window, and
+    // refuse to guess if capture-hidden windows belong to multiple processes.
+    if (bestDescriptor.name.empty() &&
+        bestDescriptor.automationId.empty()) {
+        if (HWND hiddenWindow = TryGetOnlyCaptureHiddenProcessWindow()) {
+            *targetWindow = hiddenWindow;
+            if (displayName) {
+                *displayName = DescribeWindowForUser(hiddenWindow);
+            }
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hiddenWindow, &pid);
+            Wh_Log(L"ResolveTaskbarButtonTargetWindow: empty UIA recovery selected only capture-hidden process hwnd=0x%p pid=%lu label='%s'",
+                hiddenWindow, pid,
+                displayName ? displayName->c_str() : L"");
+            return true;
+        }
     }
 
     Wh_Log(L"ResolveTaskbarButtonTargetWindow: no unambiguous target found for taskbar button name='%s' automationId='%s'",
@@ -965,34 +1146,34 @@ void ApplyHiddenBorderIndicator(HWND hwnd, bool hidden) {
         }
 
         COLORREF originalColor = kDwmDefaultColor;
-        const HRESULT getOriginalResult = DwmGetWindowAttribute(
-            hwnd, DWMWA_BORDER_COLOR, &originalColor, sizeof(originalColor));
-        if (FAILED(getOriginalResult)) {
-            Wh_Log(L"ApplyHiddenBorderIndicator: couldn't read original border color hwnd=0x%p hr=0x%08X; default color will be restored",
-                hwnd, getOriginalResult);
+        if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_BORDER_COLOR,
+                                            &originalColor,
+                                            sizeof(originalColor)))) {
+            std::scoped_lock lock(g_windowAffinityMutex);
+            g_managedWindowOriginalBorderColor.emplace(hwnd, originalColor);
         }
-        std::scoped_lock lock(g_windowAffinityMutex);
-        g_managedWindowOriginalBorderColor.emplace(hwnd, originalColor);
     } else {
         std::scoped_lock lock(g_windowAffinityMutex);
         auto it = g_managedWindowOriginalBorderColor.find(hwnd);
-        if (it == g_managedWindowOriginalBorderColor.end()) {
-            return;
+        if (it != g_managedWindowOriginalBorderColor.end()) {
+            color = it->second;
+        } else {
+            color = kDwmDefaultColor;
         }
-        color = it->second;
     }
 
-    if (SUCCEEDED(DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &color,
-                                        sizeof(color)))) {
+    const HRESULT result = DwmSetWindowAttribute(
+        hwnd, DWMWA_BORDER_COLOR, &color, sizeof(color));
+    if (SUCCEEDED(result)) {
         if (!hidden) {
             std::scoped_lock lock(g_windowAffinityMutex);
             g_managedWindowOriginalBorderColor.erase(hwnd);
         }
-        Wh_Log(L"ApplyHiddenBorderIndicator: hwnd=0x%p hidden=%d color=0x%08X",
+        Wh_Log(L"ApplyHiddenBorderIndicator: DWM border hwnd=0x%p hidden=%d color=0x%08X",
             hwnd, hidden ? 1 : 0, color);
     } else {
-        Wh_Log(L"ApplyHiddenBorderIndicator: DwmSetWindowAttribute failed hwnd=0x%p hidden=%d",
-            hwnd, hidden ? 1 : 0);
+        Wh_Log(L"ApplyHiddenBorderIndicator: DwmSetWindowAttribute failed hwnd=0x%p hidden=%d hr=0x%08X",
+            hwnd, hidden ? 1 : 0, result);
         if (hidden) {
             std::scoped_lock lock(g_windowAffinityMutex);
             g_managedWindowOriginalBorderColor.erase(hwnd);
@@ -1717,10 +1898,10 @@ void Wh_ModUninit() {
     }
     g_explorerWorkerThreadId = 0;
 
-    StopReceiverThread();
     Wh_Log(L"Wh_ModUninit: restoring all eligible windows for pid=%lu",
            GetCurrentProcessId());
     ApplyDisplayAffinityForCurrentProcess(false);
+    StopReceiverThread();
 }
 
 BOOL Wh_ModSettingsChanged(BOOL* bReload) {
