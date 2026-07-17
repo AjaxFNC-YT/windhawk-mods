@@ -16,7 +16,7 @@
 // @exclude         vgtray.exe
 // @exclude         riotclientservices.exe
 // @exclude         start_protected_game.exe
-// @compilerOptions -lole32 -loleaut32 -luuid -lshell32 -ldwmapi -lshlwapi
+// @compilerOptions -lole32 -loleaut32 -luuid -ldwmapi -lshlwapi
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -34,16 +34,19 @@ Windhawk globally excludes many common game and anti-cheat installation paths.
 These exclusions are best-effort: renamed executables, other anti-cheat
 components, and games in non-standard locations may still be injected.
 
-The protected-app setting below is a separate guard which runs only after the
-mod has already been injected. It can block the capture-hide action, but it
-cannot prevent or undo injection and is not an anti-cheat safety guarantee.
-
-You can disable the protection list in the mod settings, but targeting games can
-still cause crashes, anti-cheat problems, or in-game bans.
+An additional protected-app guard always runs after injection and blocks the
+capture-hide action for recognized protected paths. It cannot prevent or undo
+injection and is not an anti-cheat safety guarantee.
 
 ## Trigger options
 You can keep the original middle-click behavior, switch to a hover hotkey, or
 allow both from the mod settings.
+
+## Window scope
+Choose **All windows from the app** to toggle every eligible top-level window
+owned by the selected process, or **Only the selected window** to toggle the
+specific taskbar window independently. Exact per-window behavior depends on the
+taskbar exposing a distinct window handle for the hovered button.
 
 ## Compatibility
 This mod is designed for Windows 11. Windows 10 support is untested and is
@@ -58,15 +61,18 @@ most likely broken.
   $description: Applies a colored border to windows that this mod currently hides from capture.
 
 - HiddenBorderColor:
-  - Red: 136
-  - Green: 136
-  - Blue: 136
+  - Red: 255
+  - Green: 0
+  - Blue: 0
   $name: Hidden window border color
   $description: RGB color used for the border around windows hidden from capture.
 
-- DisableProtectionList: false
-  $name: Disable protected-app blocking
-  $description: Allows the mod to target apps that are normally blocked. This may cause crashes, anti-cheat issues, or in-game bans.
+- TargetScope: WholeProcess
+  $name: Windows to hide
+  $description: Choose whether a taskbar trigger toggles every window in the selected app process or only the selected window.
+  $options:
+  - WholeProcess: All windows from the app
+  - SingleWindow: Only the selected window
 
 - TriggerMode: MiddleClick
   $name: Trigger mode
@@ -108,6 +114,7 @@ most likely broken.
 #include <shlwapi.h>
 #include <uiautomation.h>
 #include <wrl.h>
+#include <windhawk_utils.h>
 
 #include <algorithm>
 #include <atomic>
@@ -128,7 +135,6 @@ constexpr wchar_t kReceiverWindowClassName[] =
     L"Windhawk.HideFromScreenCapture.Receiver.v1";
 constexpr UINT kSwallowWindowMs = 500;
 constexpr UINT kToggleSendTimeoutMs = 700;
-constexpr UINT kExplorerHookRetryTimerId = 1;
 constexpr UINT kExplorerHookRetryIntervalMs = 10000;
 constexpr UINT kExplorerToggleMessage = WM_APP + 1;
 constexpr UINT kStopReceiverMessage = WM_APP + 2;
@@ -163,6 +169,11 @@ enum class TriggerMode {
     Both = 2,
 };
 
+enum class TargetScope {
+    WholeProcess = 0,
+    SingleWindow = 1,
+};
+
 enum class TriggerModifier {
     None = 0,
     Ctrl = 1,
@@ -183,8 +194,8 @@ enum class HoverHotkey {
 
 struct ModSettings {
     bool showHiddenBorder = true;
-    COLORREF hiddenBorderColor = RGB(136, 136, 136);
-    bool disableProtectionList = false;
+    COLORREF hiddenBorderColor = RGB(255, 0, 0);
+    TargetScope targetScope = TargetScope::WholeProcess;
     TriggerMode triggerMode = TriggerMode::MiddleClick;
     TriggerModifier triggerModifier = TriggerModifier::None;
     HoverHotkey hoverHotkey = HoverHotkey::F8;
@@ -197,7 +208,6 @@ std::atomic<bool> g_processIsProtected{false};
 std::atomic<bool> g_unloading{false};
 std::mutex g_windowAffinityMutex;
 std::unordered_map<HWND, DWORD> g_managedWindowOriginalAffinity;
-std::unordered_map<HWND, COLORREF> g_managedWindowOriginalBorderColor;
 ModSettings g_settings;
 
 HANDLE g_receiverThread = nullptr;
@@ -212,7 +222,7 @@ DWORD g_explorerWorkerThreadId = 0;
 HANDLE g_explorerWorkerReadyEvent = nullptr;
 HHOOK g_explorerMouseHook = nullptr;
 HHOOK g_explorerKeyboardHook = nullptr;
-ComPtr<IUIAutomation> g_uia;
+[[clang::no_destroy]] ComPtr<IUIAutomation> g_uia;
 
 std::atomic<DWORD> g_swallowStartTick{0};
 std::atomic<bool> g_hotkeyDown{false};
@@ -220,7 +230,7 @@ std::atomic<bool> g_hotkeySwallowed{false};
 
 template <size_t N>
 bool SettingEquals(PCWSTR value, const wchar_t (&literal)[N]) {
-    return value && wcscmp(value, literal) == 0;
+    return wcscmp(value, literal) == 0;
 }
 
 void LoadSettings() {
@@ -232,10 +242,14 @@ void LoadSettings() {
     const BYTE borderBlue = static_cast<BYTE>(std::clamp(
         Wh_GetIntSetting(L"HiddenBorderColor.Blue"), 0, 255));
     g_settings.hiddenBorderColor = RGB(borderRed, borderGreen, borderBlue);
-    g_settings.disableProtectionList =
-        Wh_GetIntSetting(L"DisableProtectionList") != 0;
+    auto targetScopeSetting =
+        WindhawkUtils::StringSetting::make(L"TargetScope");
+    g_settings.targetScope = SettingEquals(targetScopeSetting, L"SingleWindow")
+                                 ? TargetScope::SingleWindow
+                                 : TargetScope::WholeProcess;
 
-    PCWSTR triggerModeSetting = Wh_GetStringSetting(L"TriggerMode");
+    auto triggerModeSetting =
+        WindhawkUtils::StringSetting::make(L"TriggerMode");
     if (SettingEquals(triggerModeSetting, L"HoverHotkey")) {
         g_settings.triggerMode = TriggerMode::HoverHotkey;
     } else if (SettingEquals(triggerModeSetting, L"Both")) {
@@ -243,9 +257,8 @@ void LoadSettings() {
     } else {
         g_settings.triggerMode = TriggerMode::MiddleClick;
     }
-    Wh_FreeStringSetting(triggerModeSetting);
-
-    PCWSTR triggerModifierSetting = Wh_GetStringSetting(L"TriggerModifier");
+    auto triggerModifierSetting =
+        WindhawkUtils::StringSetting::make(L"TriggerModifier");
     if (SettingEquals(triggerModifierSetting, L"Ctrl")) {
         g_settings.triggerModifier = TriggerModifier::Ctrl;
     } else if (SettingEquals(triggerModifierSetting, L"Shift")) {
@@ -257,9 +270,8 @@ void LoadSettings() {
     } else {
         g_settings.triggerModifier = TriggerModifier::None;
     }
-    Wh_FreeStringSetting(triggerModifierSetting);
-
-    PCWSTR hoverHotkeySetting = Wh_GetStringSetting(L"HoverHotkey");
+    auto hoverHotkeySetting =
+        WindhawkUtils::StringSetting::make(L"HoverHotkey");
     if (SettingEquals(hoverHotkeySetting, L"F9")) {
         g_settings.hoverHotkey = HoverHotkey::F9;
     } else if (SettingEquals(hoverHotkeySetting, L"F10")) {
@@ -275,12 +287,10 @@ void LoadSettings() {
     } else {
         g_settings.hoverHotkey = HoverHotkey::F8;
     }
-    Wh_FreeStringSetting(hoverHotkeySetting);
-
-    Wh_Log(L"LoadSettings: showHiddenBorder=%d hiddenBorderColor=0x%08X disableProtectionList=%d triggerMode=%d triggerModifier=%d hoverHotkey=%d",
+    Wh_Log(L"LoadSettings: showHiddenBorder=%d hiddenBorderColor=0x%08X targetScope=%d triggerMode=%d triggerModifier=%d hoverHotkey=%d",
         g_settings.showHiddenBorder ? 1 : 0,
         g_settings.hiddenBorderColor,
-        g_settings.disableProtectionList ? 1 : 0,
+        static_cast<int>(g_settings.targetScope),
         static_cast<int>(g_settings.triggerMode),
         static_cast<int>(g_settings.triggerModifier),
         static_cast<int>(g_settings.hoverHotkey));
@@ -431,10 +441,6 @@ bool PathContainsInsensitive(const std::wstring& path,
 }
 
 bool IsProtectedProcessPath(const std::wstring& imagePath) {
-    if (g_settings.disableProtectionList) {
-        return false;
-    }
-
     if (imagePath.empty()) {
         return false;
     }
@@ -1139,45 +1145,20 @@ void ApplyHiddenBorderIndicator(HWND hwnd, bool hidden) {
         return;
     }
 
-    COLORREF color = g_settings.hiddenBorderColor;
-    if (hidden) {
-        if (!g_settings.showHiddenBorder) {
-            return;
-        }
-
-        COLORREF originalColor = kDwmDefaultColor;
-        if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_BORDER_COLOR,
-                                            &originalColor,
-                                            sizeof(originalColor)))) {
-            std::scoped_lock lock(g_windowAffinityMutex);
-            g_managedWindowOriginalBorderColor.emplace(hwnd, originalColor);
-        }
-    } else {
-        std::scoped_lock lock(g_windowAffinityMutex);
-        auto it = g_managedWindowOriginalBorderColor.find(hwnd);
-        if (it != g_managedWindowOriginalBorderColor.end()) {
-            color = it->second;
-        } else {
-            color = kDwmDefaultColor;
-        }
+    if (hidden && !g_settings.showHiddenBorder) {
+        return;
     }
 
+    const COLORREF color = hidden ? g_settings.hiddenBorderColor
+                                  : kDwmDefaultColor;
     const HRESULT result = DwmSetWindowAttribute(
         hwnd, DWMWA_BORDER_COLOR, &color, sizeof(color));
     if (SUCCEEDED(result)) {
-        if (!hidden) {
-            std::scoped_lock lock(g_windowAffinityMutex);
-            g_managedWindowOriginalBorderColor.erase(hwnd);
-        }
         Wh_Log(L"ApplyHiddenBorderIndicator: DWM border hwnd=0x%p hidden=%d color=0x%08X",
             hwnd, hidden ? 1 : 0, color);
     } else {
         Wh_Log(L"ApplyHiddenBorderIndicator: DwmSetWindowAttribute failed hwnd=0x%p hidden=%d hr=0x%08X",
             hwnd, hidden ? 1 : 0, result);
-        if (hidden) {
-            std::scoped_lock lock(g_windowAffinityMutex);
-            g_managedWindowOriginalBorderColor.erase(hwnd);
-        }
     }
 }
 
@@ -1347,6 +1328,31 @@ ToggleResult ToggleDisplayAffinityForCurrentProcess(HWND sourceWindow) {
     return ApplyDisplayAffinityForCurrentProcess(hide, allowUnmanagedRestore);
 }
 
+ToggleResult ToggleDisplayAffinityForSelectedWindow(HWND sourceWindow) {
+    sourceWindow = GetAncestor(sourceWindow, GA_ROOT);
+    if (!IsWindow(sourceWindow)) {
+        return ToggleResult::Failed;
+    }
+
+    const bool isManaged = IsWindowManagedByMod(sourceWindow);
+    const bool isHidden = IsWindowCurrentlyHiddenFromCapture(sourceWindow);
+    const bool hide = !isManaged && !isHidden;
+    const bool allowUnmanagedRestore = !isManaged && isHidden;
+
+    Wh_Log(L"ToggleDisplayAffinityForSelectedWindow: pid=%lu source=0x%p managed=%d hidden=%d hide=%d allowUnmanagedRestore=%d",
+        GetCurrentProcessId(), sourceWindow, isManaged ? 1 : 0,
+        isHidden ? 1 : 0, hide ? 1 : 0,
+        allowUnmanagedRestore ? 1 : 0);
+    return ApplyDisplayAffinityForWindow(sourceWindow, hide,
+                                         allowUnmanagedRestore);
+}
+
+ToggleResult ToggleDisplayAffinity(HWND sourceWindow) {
+    return g_settings.targetScope == TargetScope::SingleWindow
+               ? ToggleDisplayAffinityForSelectedWindow(sourceWindow)
+               : ToggleDisplayAffinityForCurrentProcess(sourceWindow);
+}
+
 std::wstring GetReceiverWindowName(DWORD pid) {
     wchar_t name[96];
     swprintf_s(name, L"Windhawk.HideFromScreenCapture.Receiver.%lu", pid);
@@ -1373,8 +1379,7 @@ LRESULT CALLBACK ReceiverWindowProc(HWND hwnd,
 
         Wh_Log(L"ReceiverWindowProc: received toggle source=0x%p pid=%lu",
                sourceWindow, sourcePid);
-        return static_cast<LRESULT>(
-            ToggleDisplayAffinityForCurrentProcess(sourceWindow));
+        return static_cast<LRESULT>(ToggleDisplayAffinity(sourceWindow));
     }
 
     if (msg == kStopReceiverMessage) {
@@ -1767,14 +1772,18 @@ DWORD WINAPI ExplorerHookThreadMain(LPVOID) {
     EnsureToggleMessageRegistered();
 
     HMODULE thisModule = reinterpret_cast<HMODULE>(&__ImageBase);
-    SetTimer(nullptr, kExplorerHookRetryTimerId, kExplorerHookRetryIntervalMs,
-             nullptr);
+    const UINT_PTR retryTimer =
+        SetTimer(nullptr, 0, kExplorerHookRetryIntervalMs, nullptr);
+    if (!retryTimer) {
+        Wh_Log(L"ExplorerHookThreadMain: retry SetTimer failed gle=%lu",
+               GetLastError());
+    }
     EnsureExplorerHooksInstalled(thisModule);
 
     MSG msg;
     while (!g_unloading.load() && GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        if (msg.message == WM_TIMER &&
-            msg.wParam == kExplorerHookRetryTimerId) {
+        if (retryTimer && msg.message == WM_TIMER &&
+            msg.wParam == retryTimer) {
             EnsureExplorerHooksInstalled(thisModule);
             continue;
         }
@@ -1782,7 +1791,9 @@ DWORD WINAPI ExplorerHookThreadMain(LPVOID) {
         DispatchMessageW(&msg);
     }
 
-    KillTimer(nullptr, kExplorerHookRetryTimerId);
+    if (retryTimer) {
+        KillTimer(nullptr, retryTimer);
+    }
 
     if (g_explorerMouseHook) {
         UnhookWindowsHookEx(g_explorerMouseHook);
